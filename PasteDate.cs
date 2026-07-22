@@ -6,7 +6,7 @@ using System.Runtime.InteropServices;
 
 // 今日の日付を YYYYMMDD 形式でクリップボードにコピーし、Ctrl+V で貼り付ける
 // - クリップボード経由なので必ず半角（全角にならない）
-// - Ctrl+V は SendInput の実キー入力で送るため、サクラエディタ等でも確実
+// - Ctrl+V は keybd_event の実キー入力で送るため、サクラエディタ等でも確実
 // - エクスプローラーで「ファイルが1件だけ選択されている」ときに限り、
 //   F2 でリネームを開いて名前の末尾（拡張子の前）に日付を追加する。
 //   0件・複数選択・判定不能なときは何もリネーム操作をせず、通常の貼り付けのみ行う
@@ -15,27 +15,8 @@ using System.Runtime.InteropServices;
 // Logi Options+ の「アプリケーションを開く」で PasteDate.exe を指定して使う
 class PasteDate
 {
-    [StructLayout(LayoutKind.Sequential)]
-    struct INPUT
-    {
-        public uint type;
-        public KEYBDINPUT ki;
-        public int padding1;
-        public int padding2;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct KEYBDINPUT
-    {
-        public ushort wVk;
-        public ushort wScan;
-        public uint dwFlags;
-        public uint time;
-        public IntPtr dwExtraInfo;
-    }
-
     [DllImport("user32.dll")]
-    static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+    static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
     [DllImport("user32.dll")]
     static extern IntPtr GetForegroundWindow();
@@ -55,15 +36,14 @@ class PasteDate
     [DllImport("user32.dll")]
     static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
 
-    const uint INPUT_KEYBOARD = 1;
     const uint KEYEVENTF_KEYUP = 0x0002;
-    const ushort VK_CONTROL = 0x11;
-    const ushort VK_V = 0x56;
-    const ushort VK_F2 = 0x71;
-    const ushort VK_RIGHT = 0x27;
+    const byte VK_CONTROL = 0x11;
+    const byte VK_V = 0x56;
+    const byte VK_F2 = 0x71;
+    const byte VK_RIGHT = 0x27;
 
     // タイミング調整用の待機時間（環境によって足りない場合はここを伸ばす）
-    const int WAIT_AFTER_CLIPBOARD_MS = 250;    // クリップボード確定待ち
+    const int WAIT_AFTER_CLIPBOARD_MS = 700;    // クリップボード確定待ち（Logi側のキー状態が完全に収まるまで）
     const int WAIT_AFTER_FOCUS_MS = 80;         // フォーカス復帰待ち
     const int WAIT_AFTER_F2_MS = 150;           // リネーム編集モード開始待ち
     const int WAIT_AFTER_RIGHT_MS = 50;         // カーソル移動反映待ち
@@ -71,31 +51,25 @@ class PasteDate
     // エクスプローラーのファイルリスト／デスクトップのウィンドウクラス名
     static readonly string[] ExplorerClassNames = { "CabinetWClass", "ExploreWClass", "Progman", "WorkerW" };
 
-    static INPUT Key(ushort vk, bool up)
+    static void SendKeyEvent(byte vk, bool up)
     {
-        INPUT i = new INPUT();
-        i.type = INPUT_KEYBOARD;
-        i.ki.wVk = vk;
-        i.ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
-        return i;
+        keybd_event(vk, 0, up ? KEYEVENTF_KEYUP : 0, UIntPtr.Zero);
     }
 
-    static void SendKey(ushort vk)
+    static void SendKey(byte vk)
     {
-        INPUT[] inputs = new INPUT[2];
-        inputs[0] = Key(vk, false);
-        inputs[1] = Key(vk, true);
-        SendInput(2, inputs, Marshal.SizeOf(typeof(INPUT)));
+        SendKeyEvent(vk, false);
+        Thread.Sleep(15);
+        SendKeyEvent(vk, true);
     }
 
     static void SendCtrlV()
     {
-        INPUT[] inputs = new INPUT[4];
-        inputs[0] = Key(VK_CONTROL, false);
-        inputs[1] = Key(VK_V, false);
-        inputs[2] = Key(VK_V, true);
-        inputs[3] = Key(VK_CONTROL, true);
-        SendInput(4, inputs, Marshal.SizeOf(typeof(INPUT)));
+        SendKeyEvent(VK_CONTROL, false); // Ctrl押下
+        SendKeyEvent(VK_V, false);       // V押下
+        Thread.Sleep(30);
+        SendKeyEvent(VK_V, true);        // V離す
+        SendKeyEvent(VK_CONTROL, true);  // Ctrl離す
     }
 
     static bool IsExplorerWindow(IntPtr hwnd)
@@ -157,6 +131,12 @@ class PasteDate
     {
         if (target == IntPtr.Zero) return false;
 
+        // すでに対象ウィンドウが前面にある場合（＝Logi経由でフォーカスが
+        // 移動していない通常のケース）は、AttachThreadInput等の操作をせず
+        // そのまま何もしない。不要なフォーカス操作は一部アプリ（サクラエディタ等）の
+        // 入力状態を乱し、直後のCtrl+Vが無視される原因になり得るため。
+        if (GetForegroundWindow() == target) return true;
+
         uint targetThread = GetWindowThreadProcessId(target, IntPtr.Zero);
         uint currentThread = GetCurrentThreadId();
 
@@ -171,21 +151,24 @@ class PasteDate
         return result && GetForegroundWindow() == target;
     }
 
-    // 失敗を非モーダルのバルーン通知で知らせる。
-    // MessageBoxと違いユーザーの操作を待たず自動的に消えるため、
-    // 連打しても通知が積み重なって画面を塞ぐことがない。
+    // 失敗をビープ音で知らせつつ、原因をログファイルに記録する。
+    // バルーン通知はメッセージループが無いと表示されないことがあり信頼できないため、
+    // 確実に後から確認できるログ方式にしている。
     static void NotifyFailure(string reason)
     {
         Console.Beep(400, 300);
 
-        using (NotifyIcon icon = new NotifyIcon())
+        try
         {
-            icon.Icon = System.Drawing.SystemIcons.Warning;
-            icon.Visible = true;
-            icon.BalloonTipTitle = "PasteDate";
-            icon.BalloonTipText = "日付の入力に失敗しました: " + reason;
-            icon.ShowBalloonTip(3000);
-            Thread.Sleep(3200);
+            string logPath = System.IO.Path.Combine(
+                System.IO.Path.GetDirectoryName(Application.ExecutablePath),
+                "error_log.txt");
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + reason + Environment.NewLine;
+            System.IO.File.AppendAllText(logPath, line);
+        }
+        catch
+        {
+            // ログ書き込み自体に失敗しても、ビープ音だけは鳴っているので致命的ではない
         }
     }
 
