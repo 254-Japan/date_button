@@ -11,7 +11,7 @@ using System.Runtime.InteropServices;
 //   F2 でリネームを開いて名前の末尾（拡張子の前）に日付を追加する。
 //   0件・複数選択・判定不能なときは何もリネーム操作をせず、通常の貼り付けのみ行う
 //   （フェイルクローズ：意図が確認できない操作はしない）
-// - 失敗時は無言で終了せず、ビープ音＋非モーダルの通知バルーンで気づけるようにする
+// - 失敗時は無言で終了せず、ビープ音＋error_log.txtへの記録で原因を追えるようにする
 // Logi Options+ の「アプリケーションを開く」で PasteDate.exe を指定して使う
 class PasteDate
 {
@@ -41,6 +41,10 @@ class PasteDate
     const byte VK_V = 0x56;
     const byte VK_F2 = 0x71;
     const byte VK_RIGHT = 0x27;
+    const byte VK_MENU = 0x12;       // Alt
+    const byte VK_SHIFT = 0x10;
+    const byte VK_LWIN = 0x5B;
+    const byte VK_RWIN = 0x5C;
 
     // タイミング調整用の待機時間（環境によって足りない場合はここを伸ばす）
     const int WAIT_AFTER_CLIPBOARD_MS = 700;    // クリップボード確定待ち（Logi側のキー状態が完全に収まるまで）
@@ -50,6 +54,29 @@ class PasteDate
 
     // エクスプローラーのファイルリスト／デスクトップのウィンドウクラス名
     static readonly string[] ExplorerClassNames = { "CabinetWClass", "ExploreWClass", "Progman", "WorkerW" };
+
+    // Windowsのクリップボードは他プロセスが一瞬掴んでいるだけで
+    // OpenClipboardに失敗することがある（既知の一時的な競合）。
+    // 数回リトライしてから、それでも失敗したら例外を上げる。
+    static void SetClipboardTextWithRetry(string text)
+    {
+        const int maxAttempts = 30;
+        Exception lastError = null;
+        for (int i = 0; i < maxAttempts; i++)
+        {
+            try
+            {
+                Clipboard.SetText(text);
+                return;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                Thread.Sleep(150);
+            }
+        }
+        throw lastError;
+    }
 
     static void SendKeyEvent(byte vk, bool up)
     {
@@ -63,8 +90,22 @@ class PasteDate
         SendKeyEvent(vk, true);
     }
 
+    // Logi側のキー割り当てで使った物理キーの影響で、Alt/Shift/Winが
+    // 押しっぱなし扱いのままOSに残っていることがある（Altが残っていると
+    // メニューバーにフォーカスが移動する等の誤動作の原因になる）。
+    // 実際に押されていなくてもkeyupは無害なので、念のため全部離しておく。
+    static void ReleaseStrayModifiers()
+    {
+        SendKeyEvent(VK_MENU, true);
+        SendKeyEvent(VK_SHIFT, true);
+        SendKeyEvent(VK_LWIN, true);
+        SendKeyEvent(VK_RWIN, true);
+        Thread.Sleep(50);
+    }
+
     static void SendCtrlV()
     {
+        ReleaseStrayModifiers();
         SendKeyEvent(VK_CONTROL, false); // Ctrl押下
         SendKeyEvent(VK_V, false);       // V押下
         Thread.Sleep(30);
@@ -116,9 +157,11 @@ class PasteDate
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Shell.Application 経由での取得に失敗した場合は判定不能として扱う
+            // Shell.Application 経由での取得に失敗した場合は判定不能として扱うが、
+            // 原因が追えるようログには残す（無言で-1を返すと次回同じ不具合の調査ができない）
+            LogMessage("選択件数の取得に失敗（判定不能として扱う）: " + ex.Message);
             return -1;
         }
         return -1; // 対象ウィンドウが見つからなかった（デスクトップ等）
@@ -151,25 +194,50 @@ class PasteDate
         return result && GetForegroundWindow() == target;
     }
 
+    const int LOG_MAX_LINES = 200; // これを超えたら古い行から間引く
+
+    static string LogPath()
+    {
+        return System.IO.Path.Combine(
+            System.IO.Path.GetDirectoryName(Application.ExecutablePath),
+            "error_log.txt");
+    }
+
+    // ログに1行追記する。無制限に肥大化しないよう、上限を超えたら古い行を捨てる。
+    // ここでの失敗はビープ音だけが最後の手段になるため、握りつぶすが理由はコメントで明記する。
+    static void LogMessage(string message)
+    {
+        try
+        {
+            string path = LogPath();
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + message;
+
+            var lines = System.IO.File.Exists(path)
+                ? new System.Collections.Generic.List<string>(System.IO.File.ReadAllLines(path))
+                : new System.Collections.Generic.List<string>();
+
+            lines.Add(line);
+            if (lines.Count > LOG_MAX_LINES)
+            {
+                lines.RemoveRange(0, lines.Count - LOG_MAX_LINES);
+            }
+
+            System.IO.File.WriteAllLines(path, lines);
+        }
+        catch
+        {
+            // ログファイル自体の読み書きに失敗した場合、これ以上記録する手段がないため
+            // ここは意図的に諦める（呼び出し元でビープ音は別途鳴らしている）
+        }
+    }
+
     // 失敗をビープ音で知らせつつ、原因をログファイルに記録する。
     // バルーン通知はメッセージループが無いと表示されないことがあり信頼できないため、
     // 確実に後から確認できるログ方式にしている。
     static void NotifyFailure(string reason)
     {
         Console.Beep(400, 300);
-
-        try
-        {
-            string logPath = System.IO.Path.Combine(
-                System.IO.Path.GetDirectoryName(Application.ExecutablePath),
-                "error_log.txt");
-            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + reason + Environment.NewLine;
-            System.IO.File.AppendAllText(logPath, line);
-        }
-        catch
-        {
-            // ログ書き込み自体に失敗しても、ビープ音だけは鳴っているので致命的ではない
-        }
+        LogMessage(reason);
     }
 
     [STAThread]
@@ -192,7 +260,7 @@ class PasteDate
             bool shouldRename = isExplorer && GetExplorerSelectedCount(target) == 1;
 
             string today = DateTime.Now.ToString("yyyyMMdd");
-            Clipboard.SetText(today);
+            SetClipboardTextWithRetry(today);
             Thread.Sleep(WAIT_AFTER_CLIPBOARD_MS);
 
             if (!RestoreFocus(target))
