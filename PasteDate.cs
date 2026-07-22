@@ -153,7 +153,19 @@ class PasteDate
                 {
                     dynamic doc = win.Document;
                     dynamic selectedItems = doc.SelectedItems();
-                    return (int)selectedItems.Count;
+                    int selCount = (int)selectedItems.Count;
+
+                    // 1件選択でも、それがフォルダならリネーム対象にしない
+                    // （拡張子の前に日付を挿入する動作はファイル名を前提にしているため、
+                    // フォルダ名に対して行うと意図しない書き換えになる）
+                    if (selCount == 1)
+                    {
+                        dynamic item = selectedItems.Item(0);
+                        bool isFolder = (bool)item.IsFolder;
+                        if (isFolder) return 0;
+                    }
+
+                    return selCount;
                 }
             }
         }
