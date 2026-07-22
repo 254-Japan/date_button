@@ -7,9 +7,11 @@ using System.Runtime.InteropServices;
 // 今日の日付を YYYYMMDD 形式でクリップボードにコピーし、Ctrl+V で貼り付ける
 // - クリップボード経由なので必ず半角（全角にならない）
 // - Ctrl+V は SendInput の実キー入力で送るため、サクラエディタ等でも確実
-// - 起動時の前面ウィンドウがエクスプローラー系（ファイルウィンドウ／デスクトップ）の
-//   場合は、他プロセス起動でリネーム編集が閉じるため F2 で開き直してから貼り付ける
-// - 失敗時は無言で終了せず、ビープ音とバルーン風メッセージで気づけるようにする
+// - エクスプローラーで「ファイルが1件だけ選択されている」ときに限り、
+//   F2 でリネームを開いて名前の末尾（拡張子の前）に日付を追加する。
+//   0件・複数選択・判定不能なときは何もリネーム操作をせず、通常の貼り付けのみ行う
+//   （フェイルクローズ：意図が確認できない操作はしない）
+// - 失敗時は無言で終了せず、ビープ音＋非モーダルの通知バルーンで気づけるようにする
 // Logi Options+ の「アプリケーションを開く」で PasteDate.exe を指定して使う
 class PasteDate
 {
@@ -67,7 +69,6 @@ class PasteDate
     const int WAIT_AFTER_RIGHT_MS = 50;         // カーソル移動反映待ち
 
     // エクスプローラーのファイルリスト／デスクトップのウィンドウクラス名
-    // （ここに来た場合のみ F2 でリネームを開き直す）
     static readonly string[] ExplorerClassNames = { "CabinetWClass", "ExploreWClass", "Progman", "WorkerW" };
 
     static INPUT Key(ushort vk, bool up)
@@ -109,6 +110,46 @@ class PasteDate
         return false;
     }
 
+    // エクスプローラーで選択されているファイル件数を取得する。
+    // Shell.Application 経由で該当ウィンドウを探すため、内部コントロールの
+    // 実装（DirectUIHWND / SysListView32 など）に依存せず安定して数えられる。
+    // 判定できない場合は -1 を返し、呼び出し側は「わからない＝実行しない」と扱う。
+    static int GetExplorerSelectedCount(IntPtr hwnd)
+    {
+        try
+        {
+            Type shellAppType = Type.GetTypeFromProgID("Shell.Application");
+            if (shellAppType == null) return -1;
+
+            dynamic shellApp = Activator.CreateInstance(shellAppType);
+            dynamic windows = shellApp.Windows();
+            int count = windows.Count;
+
+            for (int i = 0; i < count; i++)
+            {
+                dynamic win = windows.Item(i);
+                if (win == null) continue;
+
+                IntPtr winHwnd;
+                try { winHwnd = new IntPtr((int)win.HWND); }
+                catch { continue; }
+
+                if (winHwnd == hwnd)
+                {
+                    dynamic doc = win.Document;
+                    dynamic selectedItems = doc.SelectedItems();
+                    return (int)selectedItems.Count;
+                }
+            }
+        }
+        catch
+        {
+            // Shell.Application 経由での取得に失敗した場合は判定不能として扱う
+            return -1;
+        }
+        return -1; // 対象ウィンドウが見つからなかった（デスクトップ等）
+    }
+
     // 対象ウィンドウを前面に戻す。成功したかどうかを返す。
     // 失敗時に後続のキー送信を行うと、見当違いのウィンドウに入力してしまうため
     // 呼び出し側で戻り値を必ず確認すること。
@@ -126,19 +167,26 @@ class PasteDate
             AttachThreadInput(currentThread, targetThread, false);
         }
 
-        // SetForegroundWindow成功後、実際にそのウィンドウが前面になったかを確認する
         Thread.Sleep(WAIT_AFTER_FOCUS_MS);
         return result && GetForegroundWindow() == target;
     }
 
+    // 失敗を非モーダルのバルーン通知で知らせる。
+    // MessageBoxと違いユーザーの操作を待たず自動的に消えるため、
+    // 連打しても通知が積み重なって画面を塞ぐことがない。
     static void NotifyFailure(string reason)
     {
         Console.Beep(400, 300);
-        MessageBox.Show(
-            "日付の入力に失敗しました。\n\n理由: " + reason + "\n\nもう一度キーを押してみてください。",
-            "PasteDate",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Warning);
+
+        using (NotifyIcon icon = new NotifyIcon())
+        {
+            icon.Icon = System.Drawing.SystemIcons.Warning;
+            icon.Visible = true;
+            icon.BalloonTipTitle = "PasteDate";
+            icon.BalloonTipText = "日付の入力に失敗しました: " + reason;
+            icon.ShowBalloonTip(3000);
+            Thread.Sleep(3200);
+        }
     }
 
     [STAThread]
@@ -156,6 +204,10 @@ class PasteDate
 
             bool isExplorer = IsExplorerWindow(target);
 
+            // ファイルがちょうど1件選択されている場合のみリネーム動作を行う。
+            // 0件（ブラウズ中）・複数選択・判定不能な場合は何もしない。
+            bool shouldRename = isExplorer && GetExplorerSelectedCount(target) == 1;
+
             string today = DateTime.Now.ToString("yyyyMMdd");
             Clipboard.SetText(today);
             Thread.Sleep(WAIT_AFTER_CLIPBOARD_MS);
@@ -166,11 +218,10 @@ class PasteDate
                 return;
             }
 
-            // エクスプローラー系なら F2 でリネームを開き直す。
-            // F2直後は拡張子を除いた名前部分が選択されるので、右矢印で
-            // 選択の右端（拡張子の直前）にカーソルを移動して日付を追加する
-            if (isExplorer)
+            if (shouldRename)
             {
+                // F2直後は拡張子を除いた名前部分が選択されるので、右矢印で
+                // 選択の右端（拡張子の直前）にカーソルを移動して日付を追加する
                 SendKey(VK_F2);
                 Thread.Sleep(WAIT_AFTER_F2_MS);
                 SendKey(VK_RIGHT);
